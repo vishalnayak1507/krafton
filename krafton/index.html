@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Coin Collector Test</title>
+    <style>
+        body { 
+            font-family: sans-serif; 
+            text-align: center; 
+            background: #222; 
+            color: #fff; 
+            margin: 0;
+            padding: 20px;
+        }
+        canvas { 
+            background: #333; 
+            border: 2px solid #555; 
+            margin-top: 10px; 
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        #score {
+            font-size: 24px;
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Multiplayer Sync Test (200ms Latency)</h1>
+    <div id="score">My Score: 0</div>
+    <p>Use Arrow Keys to Move.</p>
+    <canvas id="gameCanvas" width="600" height="600"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const socket = new WebSocket('ws://localhost:8080');
+
+        let myId = null;
+        let scoreDisplay = document.getElementById('score');
+        
+        // Input State
+        const inputs = { left: false, right: false, up: false, down: false };
+
+        // State Buffer for Interpolation
+        let serverUpdates = []; 
+        let currentCoins = [];
+        
+        // RENDER DELAY: To interpolate, we must be "behind" the server.
+        // We render at (CurrentTime - INTERPOLATION_OFFSET).
+        const INTERPOLATION_OFFSET = 100; // 100ms interpolation buffer
+
+        socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'init') {
+                myId = data.id;
+            } else if (data.type === 'update') {
+                // Push update to buffer
+                serverUpdates.push(data.state);
+                // Keep buffer small (remove very old updates)
+                if (serverUpdates.length > 20) serverUpdates.shift();
+                
+                // Update coins directly (items don't need interpolation as much as players)
+                currentCoins = data.state.coins;
+            }
+        };
+
+        // --- INPUT HANDLING ---
+        window.addEventListener('keydown', (e) => handleKey(e.key, true));
+        window.addEventListener('keyup', (e) => handleKey(e.key, false));
+
+        function handleKey(key, isPressed) {
+            let changed = false;
+            if (key === 'ArrowLeft') { inputs.left = isPressed; changed = true; }
+            if (key === 'ArrowRight') { inputs.right = isPressed; changed = true; }
+            if (key === 'ArrowUp') { inputs.up = isPressed; changed = true; }
+            if (key === 'ArrowDown') { inputs.down = isPressed; changed = true; }
+
+            // Only send if the state changed and we are connected
+            if (changed && myId) {
+                // Send intent only [cite: 23]
+                socket.send(JSON.stringify({ type: 'input', inputs: inputs }));
+            }
+        }
+
+        // --- INTERPOLATION LOGIC ---
+        // This function calculates where players were 'INTERPOLATION_OFFSET' ms ago
+        function getInterpolatedState() {
+            const renderTime = Date.now() - INTERPOLATION_OFFSET;
+
+            // Find two snapshots: one before renderTime, one after
+            let previousSnapshot = null;
+            let nextSnapshot = null;
+
+            for (let i = 0; i < serverUpdates.length - 1; i++) {
+                if (serverUpdates[i].timestamp <= renderTime && serverUpdates[i+1].timestamp >= renderTime) {
+                    previousSnapshot = serverUpdates[i];
+                    nextSnapshot = serverUpdates[i+1];
+                    break;
+                }
+            }
+
+            // If we don't have enough data yet, fallback to the latest available
+            if (!previousSnapshot || !nextSnapshot) {
+                // If we have at least one update, use it
+                if (serverUpdates.length > 0) return serverUpdates[serverUpdates.length - 1];
+                return { players: {} };
+            }
+
+            // Calculate 't' (interpolation factor, 0.0 to 1.0)
+            const totalWindow = nextSnapshot.timestamp - previousSnapshot.timestamp;
+            const timeSincePrev = renderTime - previousSnapshot.timestamp;
+            const t = timeSincePrev / totalWindow;
+
+            // Interpolate positions
+            const interpolatedPlayers = {};
+            
+            for (const id in nextSnapshot.players) {
+                const p1 = previousSnapshot.players[id];
+                const p2 = nextSnapshot.players[id];
+
+                if (p1 && p2) {
+                    // Linear Interpolation (Lerp)
+                    interpolatedPlayers[id] = {
+                        x: p1.x + (p2.x - p1.x) * t,
+                        y: p1.y + (p2.y - p1.y) * t,
+                        color: p2.color,
+                        score: p2.score
+                    };
+                }
+            }
+            return { players: interpolatedPlayers };
+        }
+
+        // --- RENDER LOOP ---
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Get the smooth, interpolated state
+            const state = getInterpolatedState();
+
+            // 1. Draw Coins
+            ctx.fillStyle = 'gold';
+            currentCoins.forEach(c => {
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
+                ctx.fill();
+                // Optional: Give coins a border
+                ctx.strokeStyle = '#d4af37';
+                ctx.stroke();
+            });
+
+            // 2. Draw Players
+            if (state && state.players) {
+                for (const id in state.players) {
+                    const p = state.players[id];
+                    
+                    // Draw Player Body
+                    ctx.fillStyle = p.color;
+                    ctx.fillRect(p.x, p.y, 20, 20);
+
+                    // Draw Score Above Head (Visual Verification)
+                    ctx.fillStyle = 'white';
+                    ctx.font = '14px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(p.score, p.x + 10, p.y - 8);
+
+                    // Update Main UI Score if it's me
+                    if (id === myId) {
+                        scoreDisplay.innerText = `My Score: ${p.score}`;
+                    }
+                }
+            }
+
+            requestAnimationFrame(draw);
+        }
+
+        // Start the loop
+        draw();
+    </script>
+</body>
+</html>
